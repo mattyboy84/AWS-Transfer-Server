@@ -1,0 +1,18 @@
+image: public.ecr.aws/sam/build-nodejs18.x:latest
+
+stages:
+  - deploy
+
+variables:
+  STACK_NAME: transfer-server
+  REGION: eu-west-2
+
+deploy:
+  stage: deploy
+  script:
+    - sam build
+    - sam package --output-template-file packaged.yaml --s3-bucket $S3_DEPLOY_BUCKET --region $REGION
+    # with domain
+    - sam deploy --no-fail-on-empty-changeset --template-file packaged.yaml --stack-name $STACK_NAME --s3-bucket $S3_DEPLOY_BUCKET --capabilities CAPABILITY_NAMED_IAM --region $REGION --parameter-overrides domainName=$ROUTE_53_DOMAIN hostedZoneId=$ROUTE_53_DOMAIN_ID domainCertArn=$ROUTE_53_DOMAIN_CERT
+    # without domain
+    #- sam deploy --no-fail-on-empty-changeset --template-file packaged.yaml --stack-name $STACK_NAME --s3-bucket $S3_DEPLOY_BUCKET --capabilities CAPABILITY_NAMED_IAM --region $REGION

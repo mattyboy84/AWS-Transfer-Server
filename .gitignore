@@ -1,0 +1,5 @@
+.aws-sam
+.vscode
+node_modules
+packaged.yaml
+scripts

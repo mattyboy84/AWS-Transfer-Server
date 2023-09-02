@@ -1,0 +1,1861 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Transform:
+  - AWS::LanguageExtensions # use Fn::ToJsonString
+  - AWS::Serverless-2016-10-31
+
+Parameters:
+  TargetEnvironment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - prod
+  vpcCIDR:
+    Type: String
+    Description: cidr block for the vpc
+    Default: 10.23.0.0/16
+  LambdaTimeout:
+    Type: Number
+    Description: timeout for the lambda functions
+    Default: 900
+##########################
+#### DOMAIN RESOURCES ####
+##########################
+  hostedZoneId:
+    Type: String
+    Description: Id of the doamin hosted zone. - leave blank to omit
+    Default: ''
+  domainCertArn:
+    Type: String
+    Description: Cert's arn of the configured domain
+    Default: ''
+  domainName:
+    Type: String
+    Description: name of domain registered in route 53. - leave blank to omit
+    Default: ''
+  subDomainName:
+    Type: String
+    Description: name of sub domain. - leave blank to omit
+    Default: ftp
+  
+Conditions:
+  IsDomainConfigured:
+    !And
+      - !Not [!Equals [!Ref hostedZoneId, '']]
+      - !Not [!Equals [!Ref domainCertArn, '']]
+      - !Not [!Equals [!Ref domainName, '']]
+  IsSubDomainConfigured:
+    !And
+      - !Not [!Equals [!Ref hostedZoneId, '']]
+      - !Not [!Equals [!Ref domainCertArn, '']]
+      - !Not [!Equals [!Ref domainName, '']]
+      - !Not [!Equals [!Ref subDomainName, '']]
+  
+Globals:
+  Function:
+    CodeUri: ./
+    Runtime: nodejs18.x
+    MemorySize: 3008
+    Timeout: !Ref LambdaTimeout
+    Environment:
+      Variables:
+        SERVER_USER_ROLE: !GetAtt transferServerUserRole.Arn
+        SERVER_EFS_ID: !Ref elasticFileSystem
+  
+Resources:
+  transferServerLoggingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-transferServerLoggingRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - transfer.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSTransferLoggingAccess"
+  
+  lambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-lambdaRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+  
+  transferServerUserRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-transferServerUserRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - transfer.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: !Sub "${AWS::StackName}-role-policy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "elasticfilesystem:ClientWrite"
+                  - "elasticfilesystem:ClientMount"
+                Resource: !GetAtt elasticFileSystem.Arn
+  
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-InternetGateway"
+  
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref TransferFamilyVPC
+  
+  networkAcl:
+    Type: AWS::EC2::NetworkAcl
+    Properties:
+      VpcId: !Ref TransferFamilyVPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-networkAcl"
+  
+  ACLInboundRule:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref networkAcl
+      RuleNumber: 100
+      Egress: false # outgoing
+      Protocol: -1 # according to this list https://en.wikipedia.org/wiki/List_of_IP_protocol_numbers
+      RuleAction: allow
+      CidrBlock: 0.0.0.0/0
+  
+  ACLOutboundRule:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref networkAcl
+      RuleNumber: 100
+      Egress: true # outgoing
+      Protocol: -1 # according to this list https://en.wikipedia.org/wiki/List_of_IP_protocol_numbers
+      RuleAction: allow
+      CidrBlock: 0.0.0.0/0
+  
+  PublicSubnetANetworkAclAssociation:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref publicSubnetA
+      NetworkAclId: !Ref networkAcl
+  
+  PublicSubnetBNetworkAclAssociation:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref publicSubnetB
+      NetworkAclId: !Ref networkAcl
+  
+  PublicSubnetCNetworkAclAssociation:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref publicSubnetC
+      NetworkAclId: !Ref networkAcl
+  
+  PrivateSubnetANetworkAclAssociation:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref privateSubnetA
+      NetworkAclId: !Ref networkAcl
+  
+  PrivateSubnetBNetworkAclAssociation:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref privateSubnetB
+      NetworkAclId: !Ref networkAcl
+  
+  PrivateSubnetCNetworkAclAssociation:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref privateSubnetC
+      NetworkAclId: !Ref networkAcl
+  
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref TransferFamilyVPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-PublicRouteTable"
+  
+  PublicRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+      RouteTableId: !Ref PublicRouteTable
+    DependsOn:
+      - VPCGatewayAttachment
+  
+  publicSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref publicSubnetA
+  
+  publicSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref publicSubnetB
+  
+  publicSubnetCRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref publicSubnetC
+  
+  TransferFamilyVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref vpcCIDR
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-VPC"
+  
+  publicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: !Select [0, !Cidr [ !GetAtt TransferFamilyVPC.CidrBlock, 6, 4 ]]
+      AvailabilityZone: !Select [0, Fn::GetAZs: !Ref "AWS::Region"]
+      VpcId: !Ref TransferFamilyVPC
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-publicSubnetA"
+  
+  publicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: !Select [1, !Cidr [ !GetAtt TransferFamilyVPC.CidrBlock, 6, 4 ]]
+      AvailabilityZone: !Select [1, Fn::GetAZs: !Ref "AWS::Region"]
+      VpcId: !Ref TransferFamilyVPC
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-publicSubnetB"
+  
+  publicSubnetC:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: !Select [2, !Cidr [ !GetAtt TransferFamilyVPC.CidrBlock, 6, 4 ]]
+      AvailabilityZone: !Select [2, Fn::GetAZs: !Ref "AWS::Region"]
+      VpcId: !Ref TransferFamilyVPC
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-publicSubnetC"
+  
+  privateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: !Select [3, !Cidr [ !GetAtt TransferFamilyVPC.CidrBlock, 6, 4 ]]
+      AvailabilityZone: !Select [0, Fn::GetAZs: !Ref "AWS::Region"]
+      VpcId: !Ref TransferFamilyVPC
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-privateSubnetA"
+  
+  privateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: !Select [4, !Cidr [ !GetAtt TransferFamilyVPC.CidrBlock, 6, 4 ]]
+      AvailabilityZone: !Select [1, Fn::GetAZs: !Ref "AWS::Region"]
+      VpcId: !Ref TransferFamilyVPC
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-privateSubnetB"
+  
+  privateSubnetC:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: !Select [5, !Cidr [ !GetAtt TransferFamilyVPC.CidrBlock, 6, 4 ]]
+      AvailabilityZone: !Select [2, Fn::GetAZs: !Ref "AWS::Region"]
+      VpcId: !Ref TransferFamilyVPC
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-privateSubnetC"
+  
+  transferServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties: 
+      GroupName: !Sub "${AWS::StackName}-SecurityGroup"
+      GroupDescription: !Sub "${AWS::StackName}-SecurityGroup description"
+      VpcId: !Ref TransferFamilyVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp #FTP
+          FromPort: 21
+          ToPort: 21
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp #SFTP
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp #Data Ports
+          FromPort: 8192
+          ToPort: 8200
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-transferServerSecurityGroup"
+  
+  efsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties: 
+      GroupName: !Sub "${AWS::StackName}-efsSecurityGroup"
+      GroupDescription: !Sub "${AWS::StackName}-efsSecurityGroup description"
+      VpcId: !Ref TransferFamilyVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-efsSecurityGroup"
+  
+  transferServer:
+    Type: AWS::Transfer::Server
+    Properties:
+      LoggingRole: !GetAtt transferServerLoggingRole.Arn
+      Certificate: !If [IsDomainConfigured, !Ref domainCertArn, !Ref "AWS::NoValue"]
+      Domain: EFS
+      EndpointType: VPC
+      EndpointDetails:
+        SecurityGroupIds:
+          - !Ref transferServerSecurityGroup
+        SubnetIds:
+          - !Ref privateSubnetA
+          - !Ref privateSubnetB
+          - !Ref privateSubnetC
+        VpcId: !Ref TransferFamilyVPC
+      Protocols:
+        - FTP
+        - !If [IsDomainConfigured, FTPS, !Ref "AWS::NoValue"] #FTPS can only be done over SSL
+        - SFTP
+      ProtocolDetails:
+        SetStatOption: DEFAULT # DEFAULT or ENABLE_NO_OP
+        TlsSessionResumptionMode: ENFORCED # DISABLED or ENABLED or ENFORCED
+      SecurityPolicyName: TransferSecurityPolicy-2022-03
+      IdentityProviderType: AWS_LAMBDA
+      IdentityProviderDetails:
+        Function: !GetAtt IdentityProviderFunction.Arn
+        SftpAuthenticationMethods: PASSWORD # Can be PASSWORD or PUBLIC_KEY or PUBLIC_KEY_AND_PASSWORD or PUBLIC_KEY_OR_PASSWORD
+  
+  transferServerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join ['', [/aws/transfer/, !GetAtt transferServer.ServerId ]]
+  
+  serverLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${AWS::StackName}-LB"
+      IpAddressType: ipv4
+      Type: network
+      Scheme: internet-facing
+      Subnets:
+        - !Ref publicSubnetA
+        - !Ref publicSubnetB
+        - !Ref publicSubnetC
+  
+  serverLoadBalancerTCP21listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      Port: 21
+      Protocol: TCP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref serverLoadBalancerTCP21TargetGroup
+      LoadBalancerArn: !Ref serverLoadBalancer
+  
+  serverLoadBalancerTCP21TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties: 
+      Name: !Sub "${AWS::StackName}-TCP-21"
+      TargetType: ip
+      IpAddressType: ipv4
+      Port: 21
+      Protocol: TCP
+      VpcId: !Ref TransferFamilyVPC
+      HealthCheckEnabled: true
+      UnhealthyThresholdCount: 2
+      HealthyThresholdCount: 2
+      HealthCheckTimeoutSeconds: 2
+      HealthCheckProtocol: TCP
+      HealthCheckIntervalSeconds: 5
+      Targets:
+        - Id: 10.23.0.52
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 21
+        - Id: 10.23.0.53
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 21
+        - Id: 10.23.0.54
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 21
+        - Id: 10.23.0.55
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 21
+        - Id: 10.23.0.56
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 21
+        - Id: 10.23.0.57
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 21
+        - Id: 10.23.0.58
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 21
+        - Id: 10.23.0.59
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 21
+        - Id: 10.23.0.60
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 21
+        - Id: 10.23.0.61
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 21
+        - Id: 10.23.0.62
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 21
+        - Id: 10.23.0.68
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 21
+        - Id: 10.23.0.69
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 21
+        - Id: 10.23.0.70
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 21
+        - Id: 10.23.0.71
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 21
+        - Id: 10.23.0.72
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 21
+        - Id: 10.23.0.73
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 21
+        - Id: 10.23.0.74
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 21
+        - Id: 10.23.0.75
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 21
+        - Id: 10.23.0.76
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 21
+        - Id: 10.23.0.77
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 21
+        - Id: 10.23.0.78
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 21
+        - Id: 10.23.0.84
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 21
+        - Id: 10.23.0.85
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 21
+        - Id: 10.23.0.86
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 21
+        - Id: 10.23.0.87
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 21
+        - Id: 10.23.0.88
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 21
+        - Id: 10.23.0.89
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 21
+        - Id: 10.23.0.90
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 21
+        - Id: 10.23.0.91
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 21
+        - Id: 10.23.0.92
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 21
+        - Id: 10.23.0.93
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 21
+        - Id: 10.23.0.94
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 21
+  
+  serverLoadBalancerTCP22listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      Port: 22
+      Protocol: TCP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref serverLoadBalancerTCP22TargetGroup
+      LoadBalancerArn: !Ref serverLoadBalancer
+  
+  serverLoadBalancerTCP22TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties: 
+      Name: !Sub "${AWS::StackName}-TCP-22"
+      TargetType: ip
+      IpAddressType: ipv4
+      Port: 22
+      Protocol: TCP
+      VpcId: !Ref TransferFamilyVPC
+      HealthCheckEnabled: true
+      UnhealthyThresholdCount: 2
+      HealthyThresholdCount: 2
+      HealthCheckTimeoutSeconds: 2
+      HealthCheckProtocol: TCP
+      HealthCheckIntervalSeconds: 5
+      Targets:
+        - Id: 10.23.0.52
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 22
+        - Id: 10.23.0.53
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 22
+        - Id: 10.23.0.54
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 22
+        - Id: 10.23.0.55
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 22
+        - Id: 10.23.0.56
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 22
+        - Id: 10.23.0.57
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 22
+        - Id: 10.23.0.58
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 22
+        - Id: 10.23.0.59
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 22
+        - Id: 10.23.0.60
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 22
+        - Id: 10.23.0.61
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 22
+        - Id: 10.23.0.62
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 22
+        - Id: 10.23.0.68
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 22
+        - Id: 10.23.0.69
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 22
+        - Id: 10.23.0.70
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 22
+        - Id: 10.23.0.71
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 22
+        - Id: 10.23.0.72
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 22
+        - Id: 10.23.0.73
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 22
+        - Id: 10.23.0.74
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 22
+        - Id: 10.23.0.75
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 22
+        - Id: 10.23.0.76
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 22
+        - Id: 10.23.0.77
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 22
+        - Id: 10.23.0.78
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 22
+        - Id: 10.23.0.84
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 22
+        - Id: 10.23.0.85
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 22
+        - Id: 10.23.0.86
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 22
+        - Id: 10.23.0.87
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 22
+        - Id: 10.23.0.88
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 22
+        - Id: 10.23.0.89
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 22
+        - Id: 10.23.0.90
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 22
+        - Id: 10.23.0.91
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 22
+        - Id: 10.23.0.92
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 22
+        - Id: 10.23.0.93
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 22
+        - Id: 10.23.0.94
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 22
+  
+  serverLoadBalancerTCP8192listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      Port: 8192
+      Protocol: TCP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref serverLoadBalancerTCP8192TargetGroup
+      LoadBalancerArn: !Ref serverLoadBalancer
+  
+  serverLoadBalancerTCP8192TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties: 
+      Name: !Sub "${AWS::StackName}-TCP-8192"
+      TargetType: ip
+      IpAddressType: ipv4
+      Port: 8192
+      Protocol: TCP
+      VpcId: !Ref TransferFamilyVPC
+      HealthCheckEnabled: true
+      UnhealthyThresholdCount: 2
+      HealthyThresholdCount: 2
+      HealthCheckTimeoutSeconds: 2
+      HealthCheckProtocol: TCP
+      HealthCheckIntervalSeconds: 5
+      Targets:
+        - Id: 10.23.0.52
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8192
+        - Id: 10.23.0.53
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8192
+        - Id: 10.23.0.54
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8192
+        - Id: 10.23.0.55
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8192
+        - Id: 10.23.0.56
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8192
+        - Id: 10.23.0.57
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8192
+        - Id: 10.23.0.58
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8192
+        - Id: 10.23.0.59
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8192
+        - Id: 10.23.0.60
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8192
+        - Id: 10.23.0.61
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8192
+        - Id: 10.23.0.62
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8192
+        - Id: 10.23.0.68
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8192
+        - Id: 10.23.0.69
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8192
+        - Id: 10.23.0.70
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8192
+        - Id: 10.23.0.71
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8192
+        - Id: 10.23.0.72
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8192
+        - Id: 10.23.0.73
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8192
+        - Id: 10.23.0.74
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8192
+        - Id: 10.23.0.75
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8192
+        - Id: 10.23.0.76
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8192
+        - Id: 10.23.0.77
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8192
+        - Id: 10.23.0.78
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8192
+        - Id: 10.23.0.84
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8192
+        - Id: 10.23.0.85
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8192
+        - Id: 10.23.0.86
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8192
+        - Id: 10.23.0.87
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8192
+        - Id: 10.23.0.88
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8192
+        - Id: 10.23.0.89
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8192
+        - Id: 10.23.0.90
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8192
+        - Id: 10.23.0.91
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8192
+        - Id: 10.23.0.92
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8192
+        - Id: 10.23.0.93
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8192
+        - Id: 10.23.0.94
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8192
+  
+  serverLoadBalancerTCP8193listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      Port: 8193
+      Protocol: TCP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref serverLoadBalancerTCP8193TargetGroup
+      LoadBalancerArn: !Ref serverLoadBalancer
+  
+  serverLoadBalancerTCP8193TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties: 
+      Name: !Sub "${AWS::StackName}-TCP-8193"
+      TargetType: ip
+      IpAddressType: ipv4
+      Port: 8193
+      Protocol: TCP
+      VpcId: !Ref TransferFamilyVPC
+      HealthCheckEnabled: true
+      UnhealthyThresholdCount: 2
+      HealthyThresholdCount: 2
+      HealthCheckTimeoutSeconds: 2
+      HealthCheckProtocol: TCP
+      HealthCheckIntervalSeconds: 5
+      Targets:
+        - Id: 10.23.0.52
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8193
+        - Id: 10.23.0.53
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8193
+        - Id: 10.23.0.54
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8193
+        - Id: 10.23.0.55
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8193
+        - Id: 10.23.0.56
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8193
+        - Id: 10.23.0.57
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8193
+        - Id: 10.23.0.58
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8193
+        - Id: 10.23.0.59
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8193
+        - Id: 10.23.0.60
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8193
+        - Id: 10.23.0.61
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8193
+        - Id: 10.23.0.62
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8193
+        - Id: 10.23.0.68
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8193
+        - Id: 10.23.0.69
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8193
+        - Id: 10.23.0.70
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8193
+        - Id: 10.23.0.71
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8193
+        - Id: 10.23.0.72
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8193
+        - Id: 10.23.0.73
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8193
+        - Id: 10.23.0.74
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8193
+        - Id: 10.23.0.75
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8193
+        - Id: 10.23.0.76
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8193
+        - Id: 10.23.0.77
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8193
+        - Id: 10.23.0.78
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8193
+        - Id: 10.23.0.84
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8193
+        - Id: 10.23.0.85
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8193
+        - Id: 10.23.0.86
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8193
+        - Id: 10.23.0.87
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8193
+        - Id: 10.23.0.88
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8193
+        - Id: 10.23.0.89
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8193
+        - Id: 10.23.0.90
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8193
+        - Id: 10.23.0.91
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8193
+        - Id: 10.23.0.92
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8193
+        - Id: 10.23.0.93
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8193
+        - Id: 10.23.0.94
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8193
+  
+  serverLoadBalancerTCP8194listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      Port: 8194
+      Protocol: TCP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref serverLoadBalancerTCP8194TargetGroup
+      LoadBalancerArn: !Ref serverLoadBalancer
+  
+  serverLoadBalancerTCP8194TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties: 
+      Name: !Sub "${AWS::StackName}-TCP-8194"
+      TargetType: ip
+      IpAddressType: ipv4
+      Port: 8194
+      Protocol: TCP
+      VpcId: !Ref TransferFamilyVPC
+      HealthCheckEnabled: true
+      UnhealthyThresholdCount: 2
+      HealthyThresholdCount: 2
+      HealthCheckTimeoutSeconds: 2
+      HealthCheckProtocol: TCP
+      HealthCheckIntervalSeconds: 5
+      Targets:
+        - Id: 10.23.0.52
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8194
+        - Id: 10.23.0.53
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8194
+        - Id: 10.23.0.54
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8194
+        - Id: 10.23.0.55
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8194
+        - Id: 10.23.0.56
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8194
+        - Id: 10.23.0.57
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8194
+        - Id: 10.23.0.58
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8194
+        - Id: 10.23.0.59
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8194
+        - Id: 10.23.0.60
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8194
+        - Id: 10.23.0.61
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8194
+        - Id: 10.23.0.62
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8194
+        - Id: 10.23.0.68
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8194
+        - Id: 10.23.0.69
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8194
+        - Id: 10.23.0.70
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8194
+        - Id: 10.23.0.71
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8194
+        - Id: 10.23.0.72
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8194
+        - Id: 10.23.0.73
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8194
+        - Id: 10.23.0.74
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8194
+        - Id: 10.23.0.75
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8194
+        - Id: 10.23.0.76
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8194
+        - Id: 10.23.0.77
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8194
+        - Id: 10.23.0.78
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8194
+        - Id: 10.23.0.84
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8194
+        - Id: 10.23.0.85
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8194
+        - Id: 10.23.0.86
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8194
+        - Id: 10.23.0.87
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8194
+        - Id: 10.23.0.88
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8194
+        - Id: 10.23.0.89
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8194
+        - Id: 10.23.0.90
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8194
+        - Id: 10.23.0.91
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8194
+        - Id: 10.23.0.92
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8194
+        - Id: 10.23.0.93
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8194
+        - Id: 10.23.0.94
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8194
+  
+  serverLoadBalancerTCP8195listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      Port: 8195
+      Protocol: TCP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref serverLoadBalancerTCP8195TargetGroup
+      LoadBalancerArn: !Ref serverLoadBalancer
+  
+  serverLoadBalancerTCP8195TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties: 
+      Name: !Sub "${AWS::StackName}-TCP-8195"
+      TargetType: ip
+      IpAddressType: ipv4
+      Port: 8195
+      Protocol: TCP
+      VpcId: !Ref TransferFamilyVPC
+      HealthCheckEnabled: true
+      UnhealthyThresholdCount: 2
+      HealthyThresholdCount: 2
+      HealthCheckTimeoutSeconds: 2
+      HealthCheckProtocol: TCP
+      HealthCheckIntervalSeconds: 5
+      Targets:
+        - Id: 10.23.0.52
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8195
+        - Id: 10.23.0.53
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8195
+        - Id: 10.23.0.54
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8195
+        - Id: 10.23.0.55
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8195
+        - Id: 10.23.0.56
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8195
+        - Id: 10.23.0.57
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8195
+        - Id: 10.23.0.58
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8195
+        - Id: 10.23.0.59
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8195
+        - Id: 10.23.0.60
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8195
+        - Id: 10.23.0.61
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8195
+        - Id: 10.23.0.62
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8195
+        - Id: 10.23.0.68
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8195
+        - Id: 10.23.0.69
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8195
+        - Id: 10.23.0.70
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8195
+        - Id: 10.23.0.71
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8195
+        - Id: 10.23.0.72
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8195
+        - Id: 10.23.0.73
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8195
+        - Id: 10.23.0.74
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8195
+        - Id: 10.23.0.75
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8195
+        - Id: 10.23.0.76
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8195
+        - Id: 10.23.0.77
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8195
+        - Id: 10.23.0.78
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8195
+        - Id: 10.23.0.84
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8195
+        - Id: 10.23.0.85
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8195
+        - Id: 10.23.0.86
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8195
+        - Id: 10.23.0.87
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8195
+        - Id: 10.23.0.88
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8195
+        - Id: 10.23.0.89
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8195
+        - Id: 10.23.0.90
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8195
+        - Id: 10.23.0.91
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8195
+        - Id: 10.23.0.92
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8195
+        - Id: 10.23.0.93
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8195
+        - Id: 10.23.0.94
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8195
+  
+  serverLoadBalancerTCP8196listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      Port: 8196
+      Protocol: TCP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref serverLoadBalancerTCP8196TargetGroup
+      LoadBalancerArn: !Ref serverLoadBalancer
+  
+  serverLoadBalancerTCP8196TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties: 
+      Name: !Sub "${AWS::StackName}-TCP-8196"
+      TargetType: ip
+      IpAddressType: ipv4
+      Port: 8196
+      Protocol: TCP
+      VpcId: !Ref TransferFamilyVPC
+      HealthCheckEnabled: true
+      UnhealthyThresholdCount: 2
+      HealthyThresholdCount: 2
+      HealthCheckTimeoutSeconds: 2
+      HealthCheckProtocol: TCP
+      HealthCheckIntervalSeconds: 5
+      Targets:
+        - Id: 10.23.0.52
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8196
+        - Id: 10.23.0.53
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8196
+        - Id: 10.23.0.54
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8196
+        - Id: 10.23.0.55
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8196
+        - Id: 10.23.0.56
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8196
+        - Id: 10.23.0.57
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8196
+        - Id: 10.23.0.58
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8196
+        - Id: 10.23.0.59
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8196
+        - Id: 10.23.0.60
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8196
+        - Id: 10.23.0.61
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8196
+        - Id: 10.23.0.62
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8196
+        - Id: 10.23.0.68
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8196
+        - Id: 10.23.0.69
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8196
+        - Id: 10.23.0.70
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8196
+        - Id: 10.23.0.71
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8196
+        - Id: 10.23.0.72
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8196
+        - Id: 10.23.0.73
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8196
+        - Id: 10.23.0.74
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8196
+        - Id: 10.23.0.75
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8196
+        - Id: 10.23.0.76
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8196
+        - Id: 10.23.0.77
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8196
+        - Id: 10.23.0.78
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8196
+        - Id: 10.23.0.84
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8196
+        - Id: 10.23.0.85
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8196
+        - Id: 10.23.0.86
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8196
+        - Id: 10.23.0.87
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8196
+        - Id: 10.23.0.88
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8196
+        - Id: 10.23.0.89
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8196
+        - Id: 10.23.0.90
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8196
+        - Id: 10.23.0.91
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8196
+        - Id: 10.23.0.92
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8196
+        - Id: 10.23.0.93
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8196
+        - Id: 10.23.0.94
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8196
+  
+  serverLoadBalancerTCP8197listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      Port: 8197
+      Protocol: TCP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref serverLoadBalancerTCP8197TargetGroup
+      LoadBalancerArn: !Ref serverLoadBalancer
+  
+  serverLoadBalancerTCP8197TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties: 
+      Name: !Sub "${AWS::StackName}-TCP-8197"
+      TargetType: ip
+      IpAddressType: ipv4
+      Port: 8197
+      Protocol: TCP
+      VpcId: !Ref TransferFamilyVPC
+      HealthCheckEnabled: true
+      UnhealthyThresholdCount: 2
+      HealthyThresholdCount: 2
+      HealthCheckTimeoutSeconds: 2
+      HealthCheckProtocol: TCP
+      HealthCheckIntervalSeconds: 5
+      Targets:
+        - Id: 10.23.0.52
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8197
+        - Id: 10.23.0.53
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8197
+        - Id: 10.23.0.54
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8197
+        - Id: 10.23.0.55
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8197
+        - Id: 10.23.0.56
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8197
+        - Id: 10.23.0.57
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8197
+        - Id: 10.23.0.58
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8197
+        - Id: 10.23.0.59
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8197
+        - Id: 10.23.0.60
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8197
+        - Id: 10.23.0.61
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8197
+        - Id: 10.23.0.62
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8197
+        - Id: 10.23.0.68
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8197
+        - Id: 10.23.0.69
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8197
+        - Id: 10.23.0.70
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8197
+        - Id: 10.23.0.71
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8197
+        - Id: 10.23.0.72
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8197
+        - Id: 10.23.0.73
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8197
+        - Id: 10.23.0.74
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8197
+        - Id: 10.23.0.75
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8197
+        - Id: 10.23.0.76
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8197
+        - Id: 10.23.0.77
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8197
+        - Id: 10.23.0.78
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8197
+        - Id: 10.23.0.84
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8197
+        - Id: 10.23.0.85
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8197
+        - Id: 10.23.0.86
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8197
+        - Id: 10.23.0.87
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8197
+        - Id: 10.23.0.88
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8197
+        - Id: 10.23.0.89
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8197
+        - Id: 10.23.0.90
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8197
+        - Id: 10.23.0.91
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8197
+        - Id: 10.23.0.92
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8197
+        - Id: 10.23.0.93
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8197
+        - Id: 10.23.0.94
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8197
+  
+  serverLoadBalancerTCP8198listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      Port: 8198
+      Protocol: TCP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref serverLoadBalancerTCP8198TargetGroup
+      LoadBalancerArn: !Ref serverLoadBalancer
+  
+  serverLoadBalancerTCP8198TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties: 
+      Name: !Sub "${AWS::StackName}-TCP-8198"
+      TargetType: ip
+      IpAddressType: ipv4
+      Port: 8198
+      Protocol: TCP
+      VpcId: !Ref TransferFamilyVPC
+      HealthCheckEnabled: true
+      UnhealthyThresholdCount: 2
+      HealthyThresholdCount: 2
+      HealthCheckTimeoutSeconds: 2
+      HealthCheckProtocol: TCP
+      HealthCheckIntervalSeconds: 5
+      Targets:
+        - Id: 10.23.0.52
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8198
+        - Id: 10.23.0.53
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8198
+        - Id: 10.23.0.54
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8198
+        - Id: 10.23.0.55
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8198
+        - Id: 10.23.0.56
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8198
+        - Id: 10.23.0.57
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8198
+        - Id: 10.23.0.58
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8198
+        - Id: 10.23.0.59
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8198
+        - Id: 10.23.0.60
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8198
+        - Id: 10.23.0.61
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8198
+        - Id: 10.23.0.62
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8198
+        - Id: 10.23.0.68
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8198
+        - Id: 10.23.0.69
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8198
+        - Id: 10.23.0.70
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8198
+        - Id: 10.23.0.71
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8198
+        - Id: 10.23.0.72
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8198
+        - Id: 10.23.0.73
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8198
+        - Id: 10.23.0.74
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8198
+        - Id: 10.23.0.75
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8198
+        - Id: 10.23.0.76
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8198
+        - Id: 10.23.0.77
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8198
+        - Id: 10.23.0.78
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8198
+        - Id: 10.23.0.84
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8198
+        - Id: 10.23.0.85
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8198
+        - Id: 10.23.0.86
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8198
+        - Id: 10.23.0.87
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8198
+        - Id: 10.23.0.88
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8198
+        - Id: 10.23.0.89
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8198
+        - Id: 10.23.0.90
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8198
+        - Id: 10.23.0.91
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8198
+        - Id: 10.23.0.92
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8198
+        - Id: 10.23.0.93
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8198
+        - Id: 10.23.0.94
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8198
+  
+  serverLoadBalancerTCP8199listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      Port: 8199
+      Protocol: TCP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref serverLoadBalancerTCP8199TargetGroup
+      LoadBalancerArn: !Ref serverLoadBalancer
+  
+  serverLoadBalancerTCP8199TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties: 
+      Name: !Sub "${AWS::StackName}-TCP-8199"
+      TargetType: ip
+      IpAddressType: ipv4
+      Port: 8199
+      Protocol: TCP
+      VpcId: !Ref TransferFamilyVPC
+      HealthCheckEnabled: true
+      UnhealthyThresholdCount: 2
+      HealthyThresholdCount: 2
+      HealthCheckTimeoutSeconds: 2
+      HealthCheckProtocol: TCP
+      HealthCheckIntervalSeconds: 5
+      Targets:
+        - Id: 10.23.0.52
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8199
+        - Id: 10.23.0.53
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8199
+        - Id: 10.23.0.54
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8199
+        - Id: 10.23.0.55
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8199
+        - Id: 10.23.0.56
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8199
+        - Id: 10.23.0.57
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8199
+        - Id: 10.23.0.58
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8199
+        - Id: 10.23.0.59
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8199
+        - Id: 10.23.0.60
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8199
+        - Id: 10.23.0.61
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8199
+        - Id: 10.23.0.62
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8199
+        - Id: 10.23.0.68
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8199
+        - Id: 10.23.0.69
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8199
+        - Id: 10.23.0.70
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8199
+        - Id: 10.23.0.71
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8199
+        - Id: 10.23.0.72
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8199
+        - Id: 10.23.0.73
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8199
+        - Id: 10.23.0.74
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8199
+        - Id: 10.23.0.75
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8199
+        - Id: 10.23.0.76
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8199
+        - Id: 10.23.0.77
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8199
+        - Id: 10.23.0.78
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8199
+        - Id: 10.23.0.84
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8199
+        - Id: 10.23.0.85
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8199
+        - Id: 10.23.0.86
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8199
+        - Id: 10.23.0.87
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8199
+        - Id: 10.23.0.88
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8199
+        - Id: 10.23.0.89
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8199
+        - Id: 10.23.0.90
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8199
+        - Id: 10.23.0.91
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8199
+        - Id: 10.23.0.92
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8199
+        - Id: 10.23.0.93
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8199
+        - Id: 10.23.0.94
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8199
+  
+  serverLoadBalancerTCP8200listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      Port: 8200
+      Protocol: TCP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref serverLoadBalancerTCP8200TargetGroup
+      LoadBalancerArn: !Ref serverLoadBalancer
+  
+  serverLoadBalancerTCP8200TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties: 
+      Name: !Sub "${AWS::StackName}-TCP-8200"
+      TargetType: ip
+      IpAddressType: ipv4
+      Port: 8200
+      Protocol: TCP
+      VpcId: !Ref TransferFamilyVPC
+      HealthCheckEnabled: true
+      UnhealthyThresholdCount: 2
+      HealthyThresholdCount: 2
+      HealthCheckTimeoutSeconds: 2
+      HealthCheckProtocol: TCP
+      HealthCheckIntervalSeconds: 5
+      Targets:
+        - Id: 10.23.0.52
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8200
+        - Id: 10.23.0.53
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8200
+        - Id: 10.23.0.54
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8200
+        - Id: 10.23.0.55
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8200
+        - Id: 10.23.0.56
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8200
+        - Id: 10.23.0.57
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8200
+        - Id: 10.23.0.58
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8200
+        - Id: 10.23.0.59
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8200
+        - Id: 10.23.0.60
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8200
+        - Id: 10.23.0.61
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8200
+        - Id: 10.23.0.62
+          AvailabilityZone: !GetAtt privateSubnetA.AvailabilityZone
+          Port: 8200
+        - Id: 10.23.0.68
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8200
+        - Id: 10.23.0.69
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8200
+        - Id: 10.23.0.70
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8200
+        - Id: 10.23.0.71
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8200
+        - Id: 10.23.0.72
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8200
+        - Id: 10.23.0.73
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8200
+        - Id: 10.23.0.74
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8200
+        - Id: 10.23.0.75
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8200
+        - Id: 10.23.0.76
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8200
+        - Id: 10.23.0.77
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8200
+        - Id: 10.23.0.78
+          AvailabilityZone: !GetAtt privateSubnetB.AvailabilityZone
+          Port: 8200
+        - Id: 10.23.0.84
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8200
+        - Id: 10.23.0.85
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8200
+        - Id: 10.23.0.86
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8200
+        - Id: 10.23.0.87
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8200
+        - Id: 10.23.0.88
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8200
+        - Id: 10.23.0.89
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8200
+        - Id: 10.23.0.90
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8200
+        - Id: 10.23.0.91
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8200
+        - Id: 10.23.0.92
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8200
+        - Id: 10.23.0.93
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8200
+        - Id: 10.23.0.94
+          AvailabilityZone: !GetAtt privateSubnetC.AvailabilityZone
+          Port: 8200
+  
+  elasticFileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      BackupPolicy:
+        Status: DISABLED
+      BypassPolicyLockoutSafetyCheck: false #default is false
+      Encrypted: true
+      LifecyclePolicies:
+        - TransitionToIA: AFTER_30_DAYS # After x days of not accessing a file, move to IA
+        - TransitionToPrimaryStorageClass: AFTER_1_ACCESS # move from IA to standard after 1 access to a file
+      PerformanceMode: generalPurpose # Can be: generalPurpose | maxIO
+      ThroughputMode: elastic  # Can be: bursting | elastic | provisioned
+      #ProvisionedThroughputInMibps: Double # Required if ThroughputMode is set to provisioned - Can be: 1-3414
+      FileSystemTags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-elasticFileSystem"
+  
+  # These expose the EFS to these subnets.
+  # Without these you get: Failed to resolve server fs-123.efs.region.amazonaws.com: Name or service not known
+  mountTargetA:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref elasticFileSystem
+      SubnetId: !Ref privateSubnetA
+      SecurityGroups:
+        - !Ref efsSecurityGroup
+  
+  mountTargetB:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref elasticFileSystem
+      SubnetId: !Ref privateSubnetB
+      SecurityGroups:
+        - !Ref efsSecurityGroup
+  
+  mountTargetC:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref elasticFileSystem
+      SubnetId: !Ref privateSubnetC
+      SecurityGroups:
+        - !Ref efsSecurityGroup
+  
+  transferServerRecord: # Alias Record Set
+    Type: AWS::Route53::RecordSet
+    Condition: IsDomainConfigured
+    Properties:
+      Name: !If [IsSubDomainConfigured, !Sub "${subDomainName}.${domainName}", !Ref domainName]
+      HostedZoneId: !Ref hostedZoneId
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt serverLoadBalancer.DNSName
+        EvaluateTargetHealth: true
+        HostedZoneId: !GetAtt serverLoadBalancer.CanonicalHostedZoneID
+  
+  IdentityProviderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-IdentityProviderFunction"
+      Role: !GetAtt lambdaRole.Arn
+      Handler: src/IdentityProvider.handler
+  
+  IdentityProviderFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join ['', [/aws/lambda/, !Ref IdentityProviderFunction]]
+  
+  IdentityProviderFunctionTransferPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt IdentityProviderFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: transfer.amazonaws.com
+      SourceArn: !GetAtt transferServer.Arn
+  
+Outputs:
+  serverUrl:
+    Value: !If [IsDomainConfigured, !If [IsSubDomainConfigured, !Sub "https://${subDomainName}.${domainName}", !Sub "https://${domainName}"], !GetAtt serverLoadBalancer.DNSName]

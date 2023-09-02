@@ -1,0 +1,10 @@
+{
+  "name": "aws-transfer-server",
+  "version": "1.0.0",
+  "description": "hello",
+  "main": "index.js",
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+  }
+}
